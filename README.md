@@ -1,4 +1,6 @@
 # J-ES-Reindex
+
+```
 Java Command Line tool for reindexing Elasticsearch Indices
 
 $ java -jar J-ES-Reindex.jar 
@@ -55,4 +57,4 @@ INFO: Indexed 15999/16956 [ 94% ] from localhost:9300/.marvel-2015.03.31  to loc
 INFO: Indexed 16955/16956 [ 99% ] from localhost:9300/.marvel-2015.03.31  to localhost:9300/reindexed 
 
 Process finished with exit code 0
-
+```
