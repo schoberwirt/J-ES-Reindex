@@ -61,9 +61,10 @@ Process finished with exit code 0
 
 
 Library dependencies
-
+```
 commons-codec-1.10.jar
 elasticsearch-x.x.x.jar
 elasticsearch-shield-x.x.x.jar
 json-simple-1.1.1.jar
 lucene-code-x.x.x.jar
+```
