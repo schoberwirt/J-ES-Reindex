@@ -73,15 +73,15 @@ public class Main {
     private static String dstClusterName = "elasticsearch";
     private static String dstIndex = "";
 
-    private static String srcClsUser = "";
-    private static String srcClsPass = "";
-    private static String dstClsUser = "";
-    private static String dstClsPass = "";
+    private static String srcClsUser = "user";
+    private static String srcClsPass = "password";
+    private static String dstClsUser = "user";
+    private static String dstClsPass = "password";
 
     private static int cfgScrollSize = 200;
     private static int cfgBulkSize = 1000;
     private static int cfgBulkConcReq = 5;
-    private static boolean cfgSniff = true;
+    private static boolean cfgSniff = false;
 
 
     //RUNTIME VALUES
@@ -107,14 +107,203 @@ public class Main {
         }
         srcIdxDocCount = countIndexDocs(srcClient, srcIndex);
         System.out.println("Reindexing " + srcIdxDocCount + " documents from " +
-                srcHost + ":" + srcPort + "//" + srcClusterName + "/" + srcIndex + " to " +
-                dstHost + ":" + dstPort + "//" + dstClusterName + "/" + dstIndex);
+                srcClusterName + "@" +srcHost + ":" + srcPort + "//" + srcClusterName + "/" + srcIndex + " to " +
+                dstClusterName + "@" +dstHost + ":" + dstPort + "//" + dstClusterName + "/" + dstIndex);
         reIndex(srcClient, dstClient, matchAllQuery(), srcIndex, dstIndex);
         closeClient(srcClient);
         closeClient(dstClient);
 
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+    public static Client initClient(String host, int port, String clusterName, String userName, String password, boolean sniff) {
+        Settings settings = ImmutableSettings.settingsBuilder()
+                .put("cluster.name", clusterName)
+                .put("client.transport.sniff", sniff)
+                .put("shield.user", userName+":"+password)
+                .build();
+        TransportClient transportClient = new TransportClient(settings);
+        transportClient.addTransportAddress(new InetSocketTransportAddress(host,port));
+        return transportClient;
+    }
+
+    public static void closeClient(Client client) {
+        if (client != null) {
+            client.close();
+        }
+    }
+
+    private static QueryBuilder matchAllQuery() {
+        return QueryBuilders.matchAllQuery();
+    }
+
+
+    public static void reIndex(Client srcClient, Client dstClient, QueryBuilder qb, String srcIndex, String dstIndex) {
+
+
+        BulkProcessor bulkProcessor = BulkProcessor.builder(dstClient,
+                createLoggingBulkProcessorListener()).setBulkActions(cfgBulkSize)
+                .setConcurrentRequests(cfgBulkConcReq)
+                .setFlushInterval(TimeValue.timeValueSeconds(1000))
+                .build();
+
+
+        try {
+            SearchResponse scrollResp = srcClient.prepareSearch(srcIndex)
+                    .setSearchType(SCAN)
+                    .setScroll(new TimeValue(60000))
+                    .setQuery(matchAllQuery().buildAsBytes())
+                    .setSize(cfgScrollSize).execute().actionGet();
+
+            scrollResp = srcClient.prepareSearchScroll(scrollResp.getScrollId()).setScroll(new TimeValue(60000)).execute().actionGet();
+
+
+            while (true) {
+                if (scrollResp.getHits().getHits().length == 0) {
+                    bulkProcessor.awaitClose(30000, TimeUnit.MILLISECONDS);
+                    break;
+                }
+                for (SearchHit hit : scrollResp.getHits()) {
+
+                    bulkProcessor.add(Requests.indexRequest(dstIndex)
+                                    .id(hit.getId())
+                                    .type(hit.getType())
+                                    .source(hit.getSourceAsString())
+                    );
+                }
+
+                scrollResp = srcClient.prepareSearchScroll(scrollResp.getScrollId()).setScroll(new TimeValue(60000)).execute().actionGet();
+                ActionFuture<NodesStatsResponse> nodesStatsResponse = getStats(dstClient);
+                double avgBulkQueueSize = getBulkQueueAvg(nodesStatsResponse);
+                boolean bulkRejects = isBulkRejecting(nodesStatsResponse);
+                int cfgBulkSizeDecrease;
+                if (bulkRejects) {
+                    System.out.println("WARN: bulk thread rejected...sleeping 10 seconds");
+                    Thread.sleep(sleepOnBulkRejected);
+                    System.out.println("WARN: resuming operations");
+                }
+                if (avgBulkQueueSize > bulkQWarnThreshold){
+                    System.out.println("WARN: detected non-null average bulk queue size " + avgBulkQueueSize);
+                    cfgBulkSizeDecrease = cfgBulkSize / 5;
+                    cfgBulkSize = cfgBulkSize - cfgBulkSizeDecrease;
+                    System.out.println("WARN: decreasing bulk-size to " + cfgBulkSize);
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static ActionFuture<NodesStatsResponse> getStats(Client client) {
+        NodesStatsRequest nodesStatsRequest = new NodesStatsRequest().clear().threadPool(true);
+        ActionFuture<NodesStatsResponse> nodesStatsResponse = client.admin().cluster().nodesStats(nodesStatsRequest);
+        return nodesStatsResponse;
+    }
+
+    private static double getBulkQueueAvg(ActionFuture<NodesStatsResponse> nodesStatsResponse){
+        //returns average bulk queue size across nodes;
+        double result = 0;
+        int howManyNodes = 1;
+        JSONParser jsonParser = new JSONParser();
+        String rawJSON = nodesStatsResponse.actionGet().toString();
+        try {
+            JSONObject rootObject = (JSONObject) jsonParser.parse(rawJSON);
+            JSONObject nodes = (JSONObject) rootObject.get("nodes");
+            Set<?> keys = nodes.keySet();
+            Iterator<?> iterator = keys.iterator();
+            while (iterator.hasNext()) {
+                // Iterate on nodes
+                // Extract nodesID
+                String nodeID = iterator.next().toString();
+                // Count nodes
+                howManyNodes++;
+                // Get Bulk Queue value
+                JSONObject node = (JSONObject) nodes.get(nodeID);
+                JSONObject threadpool = (JSONObject) node.get("thread_pool");
+                JSONObject bulk = (JSONObject) threadpool.get("bulk");
+                result += (long) bulk.get("queue");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return result/howManyNodes;
+    }
+
+    private static boolean isBulkRejecting(ActionFuture<NodesStatsResponse> nodesStatsResponse){
+        //returns true if bulk thread rejections happening;
+        boolean result = false;
+        JSONParser jsonParser = new JSONParser();
+        String rawJSON = nodesStatsResponse.actionGet().toString();
+        try {
+            JSONObject rootObject = (JSONObject) jsonParser.parse(rawJSON);
+            JSONObject nodes = (JSONObject) rootObject.get("nodes");
+            Set<?> keys = nodes.keySet();
+            Iterator<?> iterator = keys.iterator();
+            while (iterator.hasNext()) {
+                // Iterate on nodes
+                // Extract nodesID
+                String nodeID = iterator.next().toString();
+                JSONObject node = (JSONObject) nodes.get(nodeID);
+                JSONObject threadpool = (JSONObject) node.get("thread_pool");
+                JSONObject bulk = (JSONObject) threadpool.get("bulk");
+                long rejected = (long) bulk.get("rejected");
+                if (rejected > 0) return true;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    private static long countIndexDocs(Client client, String idxName) {
+        SearchResponse searchResponse = client.prepareSearch()
+                .setSearchType(COUNT)
+                .setIndices(idxName)
+                .execute()
+                .actionGet();
+        return searchResponse.getHits().getTotalHits();
+    }
+
+
+    private static BulkProcessor.Listener createLoggingBulkProcessorListener() {
+        return new BulkProcessor.Listener() {
+            @Override
+            public void beforeBulk(long executionId, BulkRequest request) {
+                if (DEBUG)
+                    System.out.println("DEBUG: Going to execute new bulk composed of {} actions: " + request.numberOfActions());
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+                if (DEBUG) System.out.println("DEBUG: Executed bulk composed of {} actions: " + request.numberOfActions());
+                dstIdxDocCount += request.numberOfActions();
+                double percentageDoneLong = (double) dstIdxDocCount / srcIdxDocCount;
+                String percentageDoneString = String.valueOf(percentageDoneLong).substring(2, 4);
+                if (srcIdxDocCount == dstIdxDocCount) {
+                    percentageDoneString = "100";
+                }
+
+                System.out.println("INFO: Indexed " + dstIdxDocCount + "/" + srcIdxDocCount + " [ " + percentageDoneString + "% ] from " + srcHost + ":" + srcPort + "/" + srcIndex + " " + " to " + dstHost + ":" + dstPort + "/" + dstIndex + " ");
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
+                System.out.println("ERROR: Error executing bulk: " + failure);
+                failure.printStackTrace();
+            }
+        };
+    }
 
     private static void printUsage(){
         System.out.println(LINE);
@@ -221,11 +410,15 @@ public class Main {
                 }
             }
         } catch (Exception e) {
+            e.printStackTrace();
+            System.exit(1);
 
         }
     }
 
     public static void printParams() {
+        System.out.println("#### SETTINGS ####");
+        System.out.println("USESAMECLS -> " + useSameCls);
         System.out.println("#### SOURCE ####");
         System.out.println("SRC HOST -> " + srcHost);
         System.out.println("SRC PORT -> " + srcPort);
@@ -247,181 +440,5 @@ public class Main {
         System.out.println("SRC PASSWORD -> " + srcClsPass);
         System.out.println("DST USERNAME -> " + dstClsUser);
         System.out.println("DST PASSWORD -> " + dstClsPass);
-    }
-
-
-    public static Client initClient(String host, int port, String clustername, String userName, String password, boolean sniff) {
-        Settings settings = ImmutableSettings.settingsBuilder()
-                .put("cluster.name", clustername)
-                .put("client.transport.sniff", sniff)
-                .put("shield.user", userName + ":" + password)
-                .build();
-
-        return new TransportClient(settings)
-                .addTransportAddress(new InetSocketTransportAddress(host, port));
-    }
-
-    public static void closeClient(Client client) {
-        if (client != null) {
-            client.close();
-        }
-    }
-
-    private static QueryBuilder matchAllQuery() {
-        return QueryBuilders.matchAllQuery();
-    }
-
-
-    public static void reIndex(Client srcClient, Client dstClient, QueryBuilder qb, String srcIndex, String dstIndex) {
-
-
-        BulkProcessor bulkProcessor = BulkProcessor.builder(dstClient,
-                createLoggingBulkProcessorListener()).setBulkActions(cfgBulkSize)
-                .setConcurrentRequests(cfgBulkConcReq)
-                .setFlushInterval(TimeValue.timeValueSeconds(1000))
-                .build();
-
-
-        try {
-            SearchResponse scrollResp = srcClient.prepareSearch(srcIndex)
-                    .setSearchType(SCAN)
-                    .setScroll(new TimeValue(60000))
-                    .setQuery(matchAllQuery().buildAsBytes())
-                    .setSize(cfgScrollSize).execute().actionGet();
-
-            scrollResp = srcClient.prepareSearchScroll(scrollResp.getScrollId()).setScroll(new TimeValue(60000)).execute().actionGet();
-
-
-            while (true) {
-                if (scrollResp.getHits().getHits().length == 0) {
-                    bulkProcessor.awaitClose(30000, TimeUnit.MILLISECONDS);
-                    break;
-                }
-                for (SearchHit hit : scrollResp.getHits()) {
-
-                    bulkProcessor.add(Requests.indexRequest(dstIndex)
-                                    .id(hit.getId())
-                                    .type(hit.getType())
-                                    .source(hit.getSourceAsString())
-                    );
-                }
-
-                scrollResp = srcClient.prepareSearchScroll(scrollResp.getScrollId()).setScroll(new TimeValue(60000)).execute().actionGet();
-                ActionFuture<NodesStatsResponse> nodesStatsResponse = getStats(dstClient);
-                double avgBulkQueueSize = getBulkQueueAvg(nodesStatsResponse);
-                boolean bulkRejects = isBulkRejecting(nodesStatsResponse);
-                int cfgBulkSizeDecrease;
-                if (bulkRejects) {
-                    System.out.println("WARN: bulk thread rejected...sleeping 10 seconds");
-                    Thread.sleep(sleepOnBulkRejected);
-                    System.out.println("WARN: resuming operations");
-                }
-                if (avgBulkQueueSize > bulkQWarnThreshold){
-                    System.out.println("WARN: detected non-null average bulk queue size " + avgBulkQueueSize);
-                    cfgBulkSizeDecrease = cfgBulkSize / 5;
-                    cfgBulkSize = cfgBulkSize - cfgBulkSizeDecrease;
-                    System.out.println("WARN: decreasing bulk-size to " + cfgBulkSize);
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    private static ActionFuture<NodesStatsResponse> getStats(Client client) {
-        NodesStatsRequest nodesStatsRequest = new NodesStatsRequest().clear().threadPool(true);
-        ActionFuture<NodesStatsResponse> nodesStatsResponse = client.admin().cluster().nodesStats(nodesStatsRequest);
-        return nodesStatsResponse;
-    }
-
-    private static double getBulkQueueAvg(ActionFuture<NodesStatsResponse> nodesStatsResponse){
-        //returns average bulk queue size across nodes;
-        double result = 0;
-        int howManyNodes = 1;
-        JSONParser jsonParser = new JSONParser();
-        String rawJSON = nodesStatsResponse.actionGet().toString();
-        try {
-            JSONObject rootObject = (JSONObject) jsonParser.parse(rawJSON);
-            JSONObject nodes = (JSONObject) rootObject.get("nodes");
-            Set<?> keys = nodes.keySet();
-            Iterator<?> iterator = keys.iterator();
-        while (iterator.hasNext()) {
-            // Iterate on nodes
-            // Extract nodesID
-            String nodeID = iterator.next().toString();
-            // Count nodes
-            howManyNodes++;
-            // Get Bulk Queue value
-            JSONObject node = (JSONObject) nodes.get(nodeID);
-            JSONObject threadpool = (JSONObject) node.get("thread_pool");
-            JSONObject bulk = (JSONObject) threadpool.get("bulk");
-            result += (long) bulk.get("queue");
-        }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        return result/howManyNodes;
-    }
-
-    private static boolean isBulkRejecting(ActionFuture<NodesStatsResponse> nodesStatsResponse){
-        //returns true if bulk thread rejections happening;
-        boolean result = false;
-        JSONParser jsonParser = new JSONParser();
-        String rawJSON = nodesStatsResponse.actionGet().toString();
-        try {
-            JSONObject rootObject = (JSONObject) jsonParser.parse(rawJSON);
-            JSONObject nodes = (JSONObject) rootObject.get("nodes");
-            Set<?> keys = nodes.keySet();
-            Iterator<?> iterator = keys.iterator();
-            while (iterator.hasNext()) {
-                // Iterate on nodes
-                // Extract nodesID
-                String nodeID = iterator.next().toString();
-                JSONObject node = (JSONObject) nodes.get(nodeID);
-                JSONObject threadpool = (JSONObject) node.get("thread_pool");
-                JSONObject bulk = (JSONObject) threadpool.get("bulk");
-                long rejected = (long) bulk.get("rejected");
-                if (rejected > 0) return true;
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        return false;
-    }
-
-    private static long countIndexDocs(Client client, String idxName) {
-        SearchResponse searchResponse = client.prepareSearch().setSearchType(COUNT)
-                .setIndices(idxName).execute().actionGet();
-        return searchResponse.getHits().getTotalHits();
-    }
-
-
-    private static BulkProcessor.Listener createLoggingBulkProcessorListener() {
-        return new BulkProcessor.Listener() {
-            @Override
-            public void beforeBulk(long executionId, BulkRequest request) {
-                if (DEBUG)
-                    System.out.println("DEBUG: Going to execute new bulk composed of {} actions: " + request.numberOfActions());
-            }
-
-            @Override
-            public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
-                if (DEBUG) System.out.println("DEBUG: Executed bulk composed of {} actions: " + request.numberOfActions());
-                dstIdxDocCount += request.numberOfActions();
-                double percentageDoneLong = (double) dstIdxDocCount / srcIdxDocCount;
-                String percentageDoneString = String.valueOf(percentageDoneLong).substring(2, 4);
-                if (srcIdxDocCount == dstIdxDocCount) {
-                    percentageDoneString = "100";
-                }
-
-                System.out.println("INFO: Indexed " + dstIdxDocCount + "/" + srcIdxDocCount + " [ " + percentageDoneString + "% ] from " + srcHost + ":" + srcPort + "/" + srcIndex + " " + " to " + dstHost + ":" + dstPort + "/" + dstIndex + " ");
-            }
-
-            @Override
-            public void afterBulk(long executionId, BulkRequest request, Throwable failure) {
-                System.out.println("ERROR: Error executing bulk: " + failure);
-                failure.printStackTrace();
-            }
-        };
     }
 }
