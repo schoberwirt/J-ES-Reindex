@@ -2,4 +2,8 @@
 
 # Package Files #
 *.jar
+*.iml
+.sonar
+.idea/*
+
 
